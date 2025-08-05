@@ -31,6 +31,7 @@ PRICE_LIST_ID = 2
 VARIANT_MAP_FILE = "variant_map.json"
 VARIANT_ID_OTHERS = 289  # Reemplazar por el ID real en Bsale
 
+
 SUCURSALES_EVO = [1, 3, 4]
 SUCURSALES_BSALE = {
     1: 1,
@@ -221,7 +222,6 @@ def construir_detalles(items_evo, rec):
                 "variantId": variant_id,
                 "netUnitValue": valor_neto
             })
-    # Fallback: si no hay detalles, usar un ítem genérico
     if not detalles:
         detalles.append({
             "quantity": 1,
@@ -281,6 +281,8 @@ def sincronizar():
     inicio, fin = rango_hoy()
     respuesta = [f"<h3>Modo: {modo.upper()} | Rango: {inicio} a {fin}</h3>"]
 
+    ventas_procesadas = set()  # Evitar duplicados entre sucursales
+
     for id_branch in SUCURSALES_EVO:
         respuesta.append(f"<b>Sucursal EVO {id_branch}</b><br>")
         try:
@@ -291,22 +293,27 @@ def sincronizar():
             continue
 
         for rec in receivables:
-            rec_id = f"receivable-{rec.get('idReceivable')}"
+            rec_id = rec.get("idReceivable")
+            if rec_id in ventas_procesadas:
+                continue  # Saltar duplicados
+            ventas_procesadas.add(rec_id)
+
+            rec_key = f"receivable-{rec_id}"
             try:
                 data = construir_boleta(rec, id_branch)
                 if modo == "prod":
                     boleta_id, error = emitir_boleta_bsale(data)
                     if boleta_id:
                         respuesta.append(f"✔ Boleta generada ID {boleta_id} para {rec.get('payerName')}<br>")
-                        registrar_en_google_sheet(rec_id, boleta_id, rec.get('payerName'), rec.get('ammountPaid'), "OK")
+                        registrar_en_google_sheet(rec_key, boleta_id, rec.get('payerName'), rec.get('ammountPaid'), "OK")
                     else:
                         respuesta.append(f"❌ Error generando boleta: {error}<br>")
-                        registrar_en_google_sheet(rec_id, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {error}")
+                        registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {error}")
                 else:
-                    respuesta.append(f"SIMULADO: {rec_id} Cliente {rec.get('payerName')}<br>")
+                    respuesta.append(f"SIMULADO: {rec_key} Cliente {rec.get('payerName')}<br>")
             except Exception as e:
-                respuesta.append(f"❌ Error {rec_id}: {str(e)}<br>")
-                registrar_en_google_sheet(rec_id, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {str(e)}")
+                respuesta.append(f"❌ Error {rec_key}: {str(e)}<br>")
+                registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {str(e)}")
 
     return "".join(respuesta)
 
@@ -342,3 +349,6 @@ def evo_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
