@@ -11,7 +11,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ============================================
-# CARGAR VARIABLES DE ENTORNO
+# CONFIGURACIÓN
 # ============================================
 load_dotenv()
 
@@ -26,18 +26,19 @@ CALLBACK_URL = os.getenv("CALLBACK_URL")
 if not EVO_USER or not EVO_PASS or not BSALE_TOKEN:
     raise RuntimeError("Faltan credenciales en variables de entorno.")
 
-DOCUMENT_TYPE_ID = 6
+DOCUMENT_TYPE_ID = 1
 PRICE_LIST_ID = 2
 VARIANT_MAP_FILE = "variant_map.json"
-CHILE_TZ = pytz.timezone("America/Santiago")
+VARIANT_ID_OTHERS = 289  # Reemplazar por el ID real en Bsale
 
-# IDs de sucursales EVO y mapeo con oficinas Bsale
 SUCURSALES_EVO = [1, 3, 4]
 SUCURSALES_BSALE = {
     1: 1,
     3: 2,
     4: 3
 }
+
+CHILE_TZ = pytz.timezone("America/Santiago")
 
 # ============================================
 # LOGGING
@@ -46,9 +47,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ============================================
-# GOOGLE SHEETS CONFIG
+# GOOGLE SHEETS
 # ============================================
-# Google Sheets + Drive scopes
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -56,18 +56,16 @@ SCOPES = [
 CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "credentials.json")
 SHEET_NAME = os.getenv("SHEET_NAME", "Ventas EVO-Bsale")
 
-# Autenticación con ambos scopes
 creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open(SHEET_NAME).sheet1
-
 
 def registrar_en_google_sheet(id_evo, id_bsale, cliente, monto, estado):
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sheet.append_row([id_evo, id_bsale, cliente, monto, estado, fecha])
 
 # ============================================
-# CARGAR MAPEOS
+# CARGAR O CREAR VARIANT MAP
 # ============================================
 if os.path.exists(VARIANT_MAP_FILE):
     with open(VARIANT_MAP_FILE, "r", encoding="utf-8") as f:
@@ -205,15 +203,17 @@ def buscar_variant_id(nombre):
     for clave, vid in VARIANT_MAP.items():
         if nombre_normalizado in clave or clave in nombre_normalizado:
             return vid
-    return None
+    # Si no existe, agregar automáticamente con ID genérico
+    VARIANT_MAP[nombre_normalizado] = VARIANT_ID_OTHERS
+    logger.warning(f"Producto no mapeado: {nombre} → agregado con ID genérico {VARIANT_ID_OTHERS}")
+    with open(VARIANT_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(VARIANT_MAP, f, indent=2, ensure_ascii=False)
+    return VARIANT_ID_OTHERS
 
-def construir_detalles(items_evo):
+def construir_detalles(items_evo, rec):
     detalles = []
     for item in items_evo:
         variant_id = buscar_variant_id(item["nombre"])
-        if not variant_id:
-            logger.warning(f"Producto no mapeado: {item['nombre']}")
-            continue
         valor_neto = round(item["precio"] / 1.19)
         if valor_neto > 0:
             detalles.append({
@@ -221,6 +221,14 @@ def construir_detalles(items_evo):
                 "variantId": variant_id,
                 "netUnitValue": valor_neto
             })
+    # Fallback: si no hay detalles, usar un ítem genérico
+    if not detalles:
+        detalles.append({
+            "quantity": 1,
+            "variantId": VARIANT_ID_OTHERS,
+            "netUnitValue": round(rec.get("ammountPaid", 0) / 1.19)
+        })
+        logger.warning(f"No había detalles válidos. Usando producto genérico para venta {rec['idSale']}")
     return detalles
 
 def construir_boleta(rec, id_branch):
@@ -240,9 +248,7 @@ def construir_boleta(rec, id_branch):
     ]
     if not items_evo:
         items_evo.append({"nombre": "Otros EVO", "precio": rec.get("ammountPaid", 0), "cantidad": 1})
-    detalles = construir_detalles(items_evo)
-    if not detalles:
-        raise ValueError(f"No hay detalles válidos para venta {rec['idSale']}")
+    detalles = construir_detalles(items_evo, rec)
 
     return {
         "emissionDate": int(datetime.now().timestamp()),
@@ -294,7 +300,7 @@ def sincronizar():
                         respuesta.append(f"✔ Boleta generada ID {boleta_id} para {rec.get('payerName')}<br>")
                         registrar_en_google_sheet(rec_id, boleta_id, rec.get('payerName'), rec.get('ammountPaid'), "OK")
                     else:
-                        respuesta.append(f"❌ Error generando boleta para {rec.get('payerName')}: {error}<br>")
+                        respuesta.append(f"❌ Error generando boleta: {error}<br>")
                         registrar_en_google_sheet(rec_id, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {error}")
                 else:
                     respuesta.append(f"SIMULADO: {rec_id} Cliente {rec.get('payerName')}<br>")
@@ -336,4 +342,3 @@ def evo_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
