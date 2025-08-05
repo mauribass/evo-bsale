@@ -48,13 +48,19 @@ logger = logging.getLogger(__name__)
 # ============================================
 # GOOGLE SHEETS CONFIG
 # ============================================
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Google Sheets + Drive scopes
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "credentials.json")
 SHEET_NAME = os.getenv("SHEET_NAME", "Ventas EVO-Bsale")
 
+# Autenticación con ambos scopes
 creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open(SHEET_NAME).sheet1
+
 
 def registrar_en_google_sheet(id_evo, id_bsale, cliente, monto, estado):
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -330,3 +336,4 @@ def evo_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
