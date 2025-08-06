@@ -62,6 +62,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ============================================
+# SESIÓN CON REINTENTOS PARA EVO Y BSALE
+# ============================================
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=2,
+    status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+
+# ============================================
 # GOOGLE SHEETS
 # ============================================
 SCOPES = [
@@ -78,15 +91,14 @@ sheet = client.open(SHEET_NAME).sheet1
 def registrar_en_google_sheet(id_evo, id_bsale, cliente, monto, estado):
     filas = sheet.get_all_values()
     for fila in filas:
-        if fila and fila[0] == id_evo:  # la primera columna es ID EVO
-            logger.info(f"Registro ya existente en Google Sheets para {id_evo}, no se duplica")
+        if fila and fila[0] == id_evo:  # evitar duplicados
+            logger.info(f"Registro ya existe en Google Sheets para {id_evo}")
             return
-    
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sheet.append_row([id_evo, id_bsale, cliente, monto, estado, fecha])
 
 # ============================================
-# CARGAR O CREAR VARIANT MAP
+# CARGAR VARIANT MAP
 # ============================================
 if os.path.exists(VARIANT_MAP_FILE):
     with open(VARIANT_MAP_FILE, "r", encoding="utf-8") as f:
@@ -97,26 +109,6 @@ else:
 # ============================================
 # FUNCIONES AUXILIARES
 # ============================================
-def normalizar_nombre(nombre):
-    if not nombre:
-        return ''
-    nombre = nombre.lower().strip()
-    nombre = ''.join(c for c in unicodedata.normalize('NFD', nombre) if unicodedata.category(c) != 'Mn')
-    return ' '.join(nombre.split())
-
-def normalizar_rut(rut):
-    if not rut:
-        return None
-    rut = rut.replace('.', '').replace('-', '').replace(' ', '').strip().upper()
-    if len(rut) < 2:
-        return None
-    cuerpo, dv = rut[:-1], rut[-1]
-    try:
-        cuerpo_int = int(cuerpo)
-    except ValueError:
-        return None
-    return f"{cuerpo_int}-{dv}"
-
 def rango_hoy():
     ahora = datetime.now(CHILE_TZ)
     return ahora.replace(hour=0, minute=0, second=0), ahora.replace(hour=23, minute=59, second=59)
@@ -160,53 +152,32 @@ def obtener_nombre_y_documento_de_sale(id_sale):
     sale = res_sale.json()
     id_member = sale.get("idMember")
     if not id_member:
-        return None, None, None
-    url_member = f"{EVO_BASE_URL_V2}/members/{id_member}"
+        return "Cliente EVO", None, None
     try:
+        url_member = f"{EVO_BASE_URL_V2}/members/{id_member}"
         res_member = session.get(url_member, auth=(EVO_USER, EVO_PASS), timeout=20)
         res_member.raise_for_status()
+        member = res_member.json()
+        nombre = f"{member.get('firstName', '').strip()} {member.get('lastName', '').strip()}".strip()
+        documento = member.get('document')
+        email = member.get('email')
+        return nombre or "Cliente EVO", documento, email
     except Exception as e:
         logger.error(f"Error obteniendo datos del miembro {id_member}: {e}")
-        return "Cliente EVO", None, None  # valores por defecto para no romper flujo
-
-    member = res_member.json()
-    nombre = f"{member.get('firstName', '').strip()} {member.get('lastName', '').strip()}".strip()
-    documento = normalizar_rut(member.get('document'))
-    email = member.get('email')
-    return nombre or "Cliente EVO", documento, email
+        return "Cliente EVO", None, None
 
 # ============================================
 # API BSALE
 # ============================================
 def buscar_o_crear_cliente(nombre, rut=None, email=None):
     headers = {"access_token": BSALE_TOKEN}
-    nombre_normalizado = normalizar_nombre(nombre)
-    rut_normalizado = normalizar_rut(rut)
 
-    if rut_normalizado:
-        offset = 0
-        while True:
-            url_rut = f"https://api.bsale.io/v1/clients.json?q={rut_normalizado}&limit=25&offset={offset}"
-            res_rut = session.get(url_rut, headers=headers)
-            res_rut.raise_for_status()
-            data_rut = res_rut.json()
-            for cliente in data_rut.get("items", []):
-                if normalizar_rut(cliente.get("taxNumber")) == rut_normalizado or normalizar_rut(cliente.get("code")) == rut_normalizado:
-                    return cliente["id"]
-            offset += 25
-            if offset >= data_rut.get("count", 0):
-                break
-
-    url_name = f"https://api.bsale.io/v1/clients.json?q={nombre}"
-    res = session.get(url_name, headers=headers)
-    res.raise_for_status()
-    for cliente in res.json().get("items", []):
-        if normalizar_nombre(cliente.get("name", "")) == nombre_normalizado:
-            return cliente["id"]
-
-    if not rut_normalizado:
-        rut_normalizado = "99999999-9"
-    if not email:
+    # Validaciones básicas
+    if not nombre:
+        nombre = "Cliente EVO"
+    if not rut:
+        rut = "99999999-9"
+    if not email or "@" not in email:
         email = f"sin-email-{int(datetime.now().timestamp())}@noemail.com"
 
     payload = {
@@ -214,24 +185,33 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
         "municipality": "Providencia",
         "city": "Santiago",
         "countryId": 1,
-        "taxNumber": rut_normalizado,
-        "code": rut_normalizado,
+        "taxNumber": rut,
+        "code": rut,
         "email": email
     }
-    res = session.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload)
-    res.raise_for_status()
-    return res.json()["id"]
 
-def buscar_variant_id(nombre):
-    nombre_normalizado = normalizar_nombre(nombre)
-    if nombre_normalizado in VARIANT_MAP:
-        return VARIANT_MAP[nombre_normalizado]
-    for clave, vid in VARIANT_MAP.items():
-        if nombre_normalizado in clave or clave in nombre_normalizado:
-            return vid
-    # Si no existe, agregar automáticamente con ID genérico
-    VARIANT_MAP[nombre_normalizado] = VARIANT_ID_OTHERS
-    logger.warning(f"Producto no mapeado: {nombre} → agregado con ID genérico {VARIANT_ID_OTHERS}")
+    try:
+        res = session.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload, timeout=20)
+        if res.status_code in [200, 201]:
+            return res.json()["id"]
+        elif res.status_code == 400:
+            logger.error(f"Error al crear cliente en Bsale: {res.text} | Payload: {payload}")
+            return None
+        res.raise_for_status()
+    except Exception as e:
+        logger.error(f"Excepción creando cliente en Bsale: {e}")
+    return None
+
+# ============================================
+# VARIANT MAP POR ID DE EVO
+# ============================================
+def buscar_variant_id(clave):
+    if clave in VARIANT_MAP:
+        return VARIANT_MAP[clave]
+
+    # Agregar automáticamente con ID genérico
+    VARIANT_MAP[clave] = VARIANT_ID_OTHERS
+    logger.warning(f"Producto no mapeado: {clave} → agregado con ID genérico {VARIANT_ID_OTHERS}")
     with open(VARIANT_MAP_FILE, "w", encoding="utf-8") as f:
         json.dump(VARIANT_MAP, f, indent=2, ensure_ascii=False)
     return VARIANT_ID_OTHERS
@@ -239,7 +219,18 @@ def buscar_variant_id(nombre):
 def construir_detalles(items_evo, rec):
     detalles = []
     for item in items_evo:
-        variant_id = buscar_variant_id(item["nombre"])
+        # Determinar la clave basada en IDs EVO
+        clave = None
+        if item.get("idProduct"):
+            clave = f"product:{item['idProduct']}"
+        elif item.get("idService"):
+            clave = f"service:{item['idService']}"
+        elif item.get("idMembership"):
+            clave = f"membership:{item['idMembership']}"
+        else:
+            clave = "unknown:0"
+
+        variant_id = buscar_variant_id(clave)
         valor_neto = round(item["precio"] / 1.19)
         if valor_neto > 0:
             detalles.append({
@@ -247,6 +238,7 @@ def construir_detalles(items_evo, rec):
                 "variantId": variant_id,
                 "netUnitValue": valor_neto
             })
+
     if not detalles:
         detalles.append({
             "quantity": 1,
@@ -258,21 +250,23 @@ def construir_detalles(items_evo, rec):
 
 def construir_boleta(rec, id_branch):
     nombre, documento, email = obtener_nombre_y_documento_de_sale(rec['idSale'])
-    if not nombre:
-        nombre = rec.get("payerName", "Cliente EVO")
-    if not documento:
-        documento = normalizar_rut(rec.get("payerDocument"))
-    if not email:
-        email = f"sin-email-{rec.get('idReceivable')}@noemail.com"
     client_id = buscar_o_crear_cliente(nombre, documento, email)
 
     sale_items = obtener_detalle_venta(rec["idSale"])
     items_evo = [
-        {"nombre": it.get("description", "").strip(), "precio": it.get("itemValue", 0), "cantidad": it.get("quantity", 1)}
+        {
+            "nombre": it.get("description", "").strip(),
+            "precio": it.get("itemValue", 0),
+            "cantidad": it.get("quantity", 1),
+            "idProduct": it.get("idProduct"),
+            "idService": it.get("idService"),
+            "idMembership": it.get("idMembership")
+        }
         for it in sale_items if it.get("description")
     ]
     if not items_evo:
-        items_evo.append({"nombre": "Otros EVO", "precio": rec.get("ammountPaid", 0), "cantidad": 1})
+        items_evo.append({"nombre": "Otros EVO", "precio": rec.get("ammountPaid", 0), "cantidad": 1,
+                          "idProduct": None, "idService": None, "idMembership": None})
     detalles = construir_detalles(items_evo, rec)
 
     return {
@@ -286,7 +280,7 @@ def construir_boleta(rec, id_branch):
 
 def emitir_boleta_bsale(data):
     headers = {"access_token": BSALE_TOKEN, "Content-Type": "application/json"}
-    res = session.post("https://api.bsale.io/v1/documents.json", headers=headers, json=data)
+    res = session.post("https://api.bsale.io/v1/documents.json", headers=headers, json=data, timeout=20)
     if res.status_code not in [200, 201]:
         try:
             error_msg = res.json().get("error", res.text)
@@ -306,7 +300,7 @@ def sincronizar():
     inicio, fin = rango_hoy()
     respuesta = [f"<h3>Modo: {modo.upper()} | Rango: {inicio} a {fin}</h3>"]
 
-    ventas_procesadas = set()  # Evitar duplicados entre sucursales
+    ventas_procesadas = set()
 
     for id_branch in SUCURSALES_EVO:
         respuesta.append(f"<b>Sucursal EVO {id_branch}</b><br>")
@@ -320,7 +314,7 @@ def sincronizar():
         for rec in receivables:
             rec_id = rec.get("idReceivable")
             if rec_id in ventas_procesadas:
-                continue  # Saltar duplicados
+                continue
             ventas_procesadas.add(rec_id)
 
             rec_key = f"receivable-{rec_id}"
@@ -372,11 +366,9 @@ def evo_webhook():
 
     return jsonify({"status": "ignored"}), 200
 
-
 @app.route("/health")
 def health():
     return "OK", 200
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
