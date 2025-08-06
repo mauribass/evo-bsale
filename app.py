@@ -9,6 +9,20 @@ import unicodedata
 from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Configurar sesión con reintentos
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,  # máximo 3 intentos
+    backoff_factor=2,  # espera exponencial: 1s, 2s, 4s
+    status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+
 
 # ============================================
 # CONFIGURACIÓN
@@ -62,6 +76,12 @@ client = gspread.authorize(creds)
 sheet = client.open(SHEET_NAME).sheet1
 
 def registrar_en_google_sheet(id_evo, id_bsale, cliente, monto, estado):
+    filas = sheet.get_all_values()
+    for fila in filas:
+        if fila and fila[0] == id_evo:  # la primera columna es ID EVO
+            logger.info(f"Registro ya existente en Google Sheets para {id_evo}, no se duplica")
+            return
+    
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sheet.append_row([id_evo, id_bsale, cliente, monto, estado, fecha])
 
@@ -115,7 +135,7 @@ def obtener_receivables(id_branch, inicio, fin):
             "take": 50,
             "skip": skip
         }
-        res = requests.get(f"{EVO_BASE_URL}/receivables", auth=(EVO_USER, EVO_PASS), params=params, timeout=20)
+        res = session.get(f"{EVO_BASE_URL}/receivables", auth=(EVO_USER, EVO_PASS), params=params, timeout=20)
         res.raise_for_status()
         data = res.json()
         lote = data if isinstance(data, list) else data.get("receivables", [])
@@ -129,21 +149,26 @@ def obtener_receivables(id_branch, inicio, fin):
 
 def obtener_detalle_venta(id_sale):
     url = f"{EVO_BASE_URL}/sales/{id_sale}"
-    res = requests.get(url, auth=(EVO_USER, EVO_PASS), timeout=10)
+    res = session.get(url, auth=(EVO_USER, EVO_PASS), timeout=20)
     res.raise_for_status()
     return res.json().get("saleItens", [])
 
 def obtener_nombre_y_documento_de_sale(id_sale):
     url_sale = f"{EVO_BASE_URL}/sales/{id_sale}"
-    res_sale = requests.get(url_sale, auth=(EVO_USER, EVO_PASS), timeout=10)
+    res_sale = session.get(url_sale, auth=(EVO_USER, EVO_PASS), timeout=20)
     res_sale.raise_for_status()
     sale = res_sale.json()
     id_member = sale.get("idMember")
     if not id_member:
         return None, None, None
     url_member = f"{EVO_BASE_URL_V2}/members/{id_member}"
-    res_member = requests.get(url_member, auth=(EVO_USER, EVO_PASS), timeout=10)
-    res_member.raise_for_status()
+    try:
+        res_member = session.get(url_member, auth=(EVO_USER, EVO_PASS), timeout=20)
+        res_member.raise_for_status()
+    except Exception as e:
+        logger.error(f"Error obteniendo datos del miembro {id_member}: {e}")
+        return "Cliente EVO", None, None  # valores por defecto para no romper flujo
+
     member = res_member.json()
     nombre = f"{member.get('firstName', '').strip()} {member.get('lastName', '').strip()}".strip()
     documento = normalizar_rut(member.get('document'))
@@ -162,7 +187,7 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
         offset = 0
         while True:
             url_rut = f"https://api.bsale.io/v1/clients.json?q={rut_normalizado}&limit=25&offset={offset}"
-            res_rut = requests.get(url_rut, headers=headers)
+            res_rut = session.get(url_rut, headers=headers)
             res_rut.raise_for_status()
             data_rut = res_rut.json()
             for cliente in data_rut.get("items", []):
@@ -173,7 +198,7 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
                 break
 
     url_name = f"https://api.bsale.io/v1/clients.json?q={nombre}"
-    res = requests.get(url_name, headers=headers)
+    res = session.get(url_name, headers=headers)
     res.raise_for_status()
     for cliente in res.json().get("items", []):
         if normalizar_nombre(cliente.get("name", "")) == nombre_normalizado:
@@ -193,7 +218,7 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
         "code": rut_normalizado,
         "email": email
     }
-    res = requests.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload)
+    res = session.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload)
     res.raise_for_status()
     return res.json()["id"]
 
@@ -261,7 +286,7 @@ def construir_boleta(rec, id_branch):
 
 def emitir_boleta_bsale(data):
     headers = {"access_token": BSALE_TOKEN, "Content-Type": "application/json"}
-    res = requests.post("https://api.bsale.io/v1/documents.json", headers=headers, json=data)
+    res = session.post("https://api.bsale.io/v1/documents.json", headers=headers, json=data)
     if res.status_code not in [200, 201]:
         try:
             error_msg = res.json().get("error", res.text)
@@ -347,8 +372,15 @@ def evo_webhook():
 
     return jsonify({"status": "ignored"}), 200
 
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
