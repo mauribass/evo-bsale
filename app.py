@@ -40,10 +40,10 @@ CALLBACK_URL = os.getenv("CALLBACK_URL")
 if not EVO_USER or not EVO_PASS or not BSALE_TOKEN:
     raise RuntimeError("Faltan credenciales en variables de entorno.")
 
-DOCUMENT_TYPE_ID = 1
+DOCUMENT_TYPE_ID = 6
 PRICE_LIST_ID = 2
 VARIANT_MAP_FILE = "variant_map.json"
-VARIANT_ID_OTHERS = 289  # Reemplazar por el ID real en Bsale
+VARIANT_ID_OTHERS = 1244  # Reemplazar por el ID real en Bsale
 
 
 SUCURSALES_EVO = [1, 3, 4]
@@ -364,6 +364,7 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
 
