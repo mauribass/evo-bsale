@@ -172,14 +172,31 @@ def obtener_nombre_y_documento_de_sale(id_sale):
 def buscar_o_crear_cliente(nombre, rut=None, email=None):
     headers = {"access_token": BSALE_TOKEN}
 
-    # Validaciones básicas
+    # Validar nombre
     if not nombre:
         nombre = "Cliente EVO"
-    if not rut:
-        rut = "99999999-9"
+
+    # Normalizar email
     if not email or "@" not in email:
         email = f"sin-email-{int(datetime.now().timestamp())}@noemail.com"
 
+    # Normalizar RUT
+    if not rut:
+        rut = f"99999999-{int(datetime.now().timestamp())}"
+
+    # 🔍 Buscar si ya existe cliente con este RUT
+    try:
+        url_busqueda = f"https://api.bsale.io/v1/clients.json?taxnumber={rut}"
+        res = session.get(url_busqueda, headers=headers, timeout=20)
+        res.raise_for_status()
+        items = res.json().get("items", [])
+        if items:
+            logger.info(f"Cliente ya existe en Bsale con RUT {rut}, ID: {items[0]['id']}")
+            return items[0]["id"]
+    except Exception as e:
+        logger.warning(f"No se pudo buscar cliente por RUT {rut}: {e}")
+
+    # 📦 Crear nuevo cliente si no existe
     payload = {
         "name": nombre,
         "municipality": "Providencia",
@@ -189,6 +206,19 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
         "code": rut,
         "email": email
     }
+
+    try:
+        res = session.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload, timeout=20)
+        if res.status_code in [200, 201]:
+            logger.info(f"Cliente creado en Bsale: {nombre} ({rut})")
+            return res.json()["id"]
+        elif res.status_code == 400:
+            logger.error(f"Error al crear cliente en Bsale: {res.text} | Payload: {payload}")
+            return None
+        res.raise_for_status()
+    except Exception as e:
+        logger.error(f"Excepción creando cliente en Bsale: {e}")
+    return None
 
     try:
         res = session.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload, timeout=20)
@@ -372,6 +402,7 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
 
