@@ -107,8 +107,15 @@ else:
     VARIANT_MAP = {}
 
 # ============================================
-# FUNCIONES AUXILIARES
+# FUNCIONES AUXILIARES PARA NOMBRE Y FECHA
 # ============================================
+def normalizar_nombre(nombre):
+    if not nombre:
+        return ''
+    nombre = nombre.lower().strip()
+    nombre = ''.join(c for c in unicodedata.normalize('NFD', nombre) if unicodedata.category(c) != 'Mn')
+    return ' '.join(nombre.split())
+
 def rango_hoy():
     ahora = datetime.now(CHILE_TZ)
     return ahora.replace(hour=0, minute=0, second=0), ahora.replace(hour=23, minute=59, second=59)
@@ -167,16 +174,52 @@ def obtener_nombre_y_documento_de_sale(id_sale):
         return "Cliente EVO", None, None
 
 # ============================================
-# API BSALE
+# MAPEADOR POR NOMBRE (core del matcheo anterior)
+# ============================================
+def buscar_variant_id(nombre):
+    nombre_normalizado = normalizar_nombre(nombre)
+    if nombre_normalizado in VARIANT_MAP:
+        return VARIANT_MAP[nombre_normalizado]
+    for clave, vid in VARIANT_MAP.items():
+        if nombre_normalizado in clave or clave in nombre_normalizado:
+            return vid
+    # Si no existe, agregar automáticamente con ID genérico
+    VARIANT_MAP[nombre_normalizado] = VARIANT_ID_OTHERS
+    logger.warning(f"Producto no mapeado: {nombre} → agregado con ID genérico {VARIANT_ID_OTHERS}")
+    with open(VARIANT_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(VARIANT_MAP, f, indent=2, ensure_ascii=False)
+    return VARIANT_ID_OTHERS
+
+def construir_detalles(items_evo, rec):
+    detalles = []
+    for item in items_evo:
+        variant_id = buscar_variant_id(item["nombre"])
+        valor_neto = round(item["precio"] / 1.19)
+        if valor_neto > 0:
+            detalles.append({
+                "quantity": item.get("cantidad", 1),
+                "variantId": variant_id,
+                "netUnitValue": valor_neto
+            })
+    if not detalles:
+        detalles.append({
+            "quantity": 1,
+            "variantId": VARIANT_ID_OTHERS,
+            "netUnitValue": round(rec.get("ammountPaid", 0) / 1.19)
+        })
+        logger.warning(f"No había detalles válidos. Usando producto genérico para venta {rec['idSale']}")
+    return detalles
+
+# ============================================
+# CLIENTES EN BSALE (sin creación automática)
 # ============================================
 def buscar_o_crear_cliente(nombre, rut=None, email=None):
     headers = {"access_token": BSALE_TOKEN}
 
     if not rut:
         logger.info("No hay RUT. No se creará cliente ni se asociará ID.")
-        return None  # No intentamos crear cliente sin RUT
+        return None
 
-    # Buscar cliente por taxNumber
     try:
         url_busqueda = f"https://api.bsale.io/v1/clients.json?taxnumber={rut}"
         res = session.get(url_busqueda, headers=headers, timeout=20)
@@ -192,53 +235,9 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
         logger.warning(f"No se pudo buscar cliente por RUT {rut}: {e}")
         return None
 
-
 # ============================================
-# VARIANT MAP POR ID DE EVO
+# CONSTRUCCIÓN DE BOLETA
 # ============================================
-def buscar_variant_id(clave):
-    if clave in VARIANT_MAP:
-        return VARIANT_MAP[clave]
-
-    # Agregar automáticamente con ID genérico
-    VARIANT_MAP[clave] = VARIANT_ID_OTHERS
-    logger.warning(f"Producto no mapeado: {clave} → agregado con ID genérico {VARIANT_ID_OTHERS}")
-    with open(VARIANT_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(VARIANT_MAP, f, indent=2, ensure_ascii=False)
-    return VARIANT_ID_OTHERS
-
-def construir_detalles(items_evo, rec):
-    detalles = []
-    for item in items_evo:
-        # Determinar la clave basada en IDs EVO
-        clave = None
-        if item.get("idProduct"):
-            clave = f"product:{item['idProduct']}"
-        elif item.get("idService"):
-            clave = f"service:{item['idService']}"
-        elif item.get("idMembership"):
-            clave = f"membership:{item['idMembership']}"
-        else:
-            clave = "unknown:0"
-
-        variant_id = buscar_variant_id(clave)
-        valor_neto = round(item["precio"] / 1.19)
-        if valor_neto > 0:
-            detalles.append({
-                "quantity": item.get("cantidad", 1),
-                "variantId": variant_id,
-                "netUnitValue": valor_neto
-            })
-
-    if not detalles:
-        detalles.append({
-            "quantity": 1,
-            "variantId": VARIANT_ID_OTHERS,
-            "netUnitValue": round(rec.get("ammountPaid", 0) / 1.19)
-        })
-        logger.warning(f"No había detalles válidos. Usando producto genérico para venta {rec['idSale']}")
-    return detalles
-
 def construir_boleta(rec, id_branch):
     nombre, documento, email = obtener_nombre_y_documento_de_sale(rec['idSale'])
     client_id = buscar_o_crear_cliente(nombre, documento, email)
@@ -249,15 +248,11 @@ def construir_boleta(rec, id_branch):
             "nombre": it.get("description", "").strip(),
             "precio": it.get("itemValue", 0),
             "cantidad": it.get("quantity", 1),
-            "idProduct": it.get("idProduct"),
-            "idService": it.get("idService"),
-            "idMembership": it.get("idMembership")
         }
         for it in sale_items if it.get("description")
     ]
     if not items_evo:
-        items_evo.append({"nombre": "Otros EVO", "precio": rec.get("ammountPaid", 0), "cantidad": 1,
-                          "idProduct": None, "idService": None, "idMembership": None})
+        items_evo.append({"nombre": "Otros EVO", "precio": rec.get("ammountPaid", 0), "cantidad": 1})
     detalles = construir_detalles(items_evo, rec)
 
     return {
@@ -265,10 +260,9 @@ def construir_boleta(rec, id_branch):
         "documentTypeId": DOCUMENT_TYPE_ID,
         "priceListId": PRICE_LIST_ID,
         "officeId": SUCURSALES_BSALE[id_branch],
-        "clientId": client_id,  # <--- deja vacío si no existe
+        "clientId": client_id,
         "details": detalles
     }
-
 
 def emitir_boleta_bsale(data):
     headers = {"access_token": BSALE_TOKEN, "Content-Type": "application/json"}
@@ -282,7 +276,7 @@ def emitir_boleta_bsale(data):
     return res.json().get("id"), None
 
 # ============================================
-# FLASK APP
+# FLASK APP (Google Sheets + Filtro Fecha + Evita duplicados)
 # ============================================
 app = Flask(__name__)
 
@@ -290,10 +284,10 @@ app = Flask(__name__)
 def sincronizar():
     modo = request.args.get("modo", "test")
     inicio, fin = rango_hoy()
+    hoy = datetime.now(CHILE_TZ).strftime("%Y-%m-%d")
     respuesta = [f"<h3>Modo: {modo.upper()} | Rango: {inicio} a {fin}</h3>"]
 
     ventas_procesadas = set()
-    hoy = datetime.now(CHILE_TZ).strftime("%Y-%m-%d")  # Fecha actual en formato 'YYYY-MM-DD'
 
     for id_branch in SUCURSALES_EVO:
         respuesta.append(f"<b>Sucursal EVO {id_branch}</b><br>")
@@ -303,20 +297,20 @@ def sincronizar():
             logger.error(f"Error conexión EVO: {e}")
             respuesta.append(f"Error conexión EVO: {str(e)}<br>")
             continue
-    
+
         for rec in receivables:
             sale_date_str = rec.get("saleDate")
             if not sale_date_str:
                 continue
-            sale_date = sale_date_str.split("T")[0]  # Sólo la fecha, sin hora
+            sale_date = sale_date_str.split("T")[0]
             if sale_date != hoy:
-                continue  # ⛔️ Salteá si la venta no es de hoy
-    
+                continue
+
             rec_id = rec.get("idReceivable")
             if rec_id in ventas_procesadas:
                 continue
             ventas_procesadas.add(rec_id)
-    
+
             rec_key = f"receivable-{rec_id}"
             try:
                 data = construir_boleta(rec, id_branch)
