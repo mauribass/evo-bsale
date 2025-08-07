@@ -217,10 +217,11 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
     headers = {"access_token": BSALE_TOKEN}
 
     if not rut:
-        logger.info("No hay RUT. No se creará cliente ni se asociará ID.")
+        logger.info("No hay RUT. No se buscará ni asociará cliente.")
         return None
 
     try:
+        # Buscar cliente por taxNumber (RUT)
         url_busqueda = f"https://api.bsale.io/v1/clients.json?taxnumber={rut}"
         res = session.get(url_busqueda, headers=headers, timeout=20)
         res.raise_for_status()
@@ -229,11 +230,12 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
             logger.info(f"Cliente ya existe en Bsale con RUT {rut}, ID: {items[0]['id']}")
             return items[0]["id"]
         else:
-            logger.info(f"No existe cliente en Bsale con RUT {rut}. No se creará uno nuevo.")
+            logger.info(f"No existe cliente en Bsale con RUT {rut}. Se emitirá boleta sin cliente asociado.")
             return None
     except Exception as e:
         logger.warning(f"No se pudo buscar cliente por RUT {rut}: {e}")
         return None
+
 
 # ============================================
 # CONSTRUCCIÓN DE BOLETA
@@ -366,6 +368,7 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
 
