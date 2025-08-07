@@ -172,19 +172,11 @@ def obtener_nombre_y_documento_de_sale(id_sale):
 def buscar_o_crear_cliente(nombre, rut=None, email=None):
     headers = {"access_token": BSALE_TOKEN}
 
-    # Validar nombre
-    if not nombre:
-        nombre = "Cliente EVO"
-
-    # Normalizar email
-    if not email or "@" not in email:
-        email = f"sin-email-{int(datetime.now().timestamp())}@noemail.com"
-
-    # Normalizar RUT
     if not rut:
-        rut = f"99999999-{int(datetime.now().timestamp())}"
+        logger.info("No hay RUT. No se creará cliente ni se asociará ID.")
+        return None  # No intentamos crear cliente sin RUT
 
-    # 🔍 Buscar si ya existe cliente con este RUT
+    # Buscar cliente por taxNumber
     try:
         url_busqueda = f"https://api.bsale.io/v1/clients.json?taxnumber={rut}"
         res = session.get(url_busqueda, headers=headers, timeout=20)
@@ -193,44 +185,13 @@ def buscar_o_crear_cliente(nombre, rut=None, email=None):
         if items:
             logger.info(f"Cliente ya existe en Bsale con RUT {rut}, ID: {items[0]['id']}")
             return items[0]["id"]
+        else:
+            logger.info(f"No existe cliente en Bsale con RUT {rut}. No se creará uno nuevo.")
+            return None
     except Exception as e:
         logger.warning(f"No se pudo buscar cliente por RUT {rut}: {e}")
+        return None
 
-    # 📦 Crear nuevo cliente si no existe
-    payload = {
-        "name": nombre,
-        "municipality": "Providencia",
-        "city": "Santiago",
-        "countryId": 1,
-        "taxNumber": rut,
-        "code": rut,
-        "email": email
-    }
-
-    try:
-        res = session.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload, timeout=20)
-        if res.status_code in [200, 201]:
-            logger.info(f"Cliente creado en Bsale: {nombre} ({rut})")
-            return res.json()["id"]
-        elif res.status_code == 400:
-            logger.error(f"Error al crear cliente en Bsale: {res.text} | Payload: {payload}")
-            return None
-        res.raise_for_status()
-    except Exception as e:
-        logger.error(f"Excepción creando cliente en Bsale: {e}")
-    return None
-
-    try:
-        res = session.post("https://api.bsale.io/v1/clients.json", headers=headers, json=payload, timeout=20)
-        if res.status_code in [200, 201]:
-            return res.json()["id"]
-        elif res.status_code == 400:
-            logger.error(f"Error al crear cliente en Bsale: {res.text} | Payload: {payload}")
-            return None
-        res.raise_for_status()
-    except Exception as e:
-        logger.error(f"Excepción creando cliente en Bsale: {e}")
-    return None
 
 # ============================================
 # VARIANT MAP POR ID DE EVO
@@ -304,9 +265,10 @@ def construir_boleta(rec, id_branch):
         "documentTypeId": DOCUMENT_TYPE_ID,
         "priceListId": PRICE_LIST_ID,
         "officeId": SUCURSALES_BSALE[id_branch],
-        "clientId": client_id,
+        "clientId": client_id,  # <--- deja vacío si no existe
         "details": detalles
     }
+
 
 def emitir_boleta_bsale(data):
     headers = {"access_token": BSALE_TOKEN, "Content-Type": "application/json"}
@@ -402,6 +364,7 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
 
