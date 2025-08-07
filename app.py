@@ -293,38 +293,46 @@ def sincronizar():
     respuesta = [f"<h3>Modo: {modo.upper()} | Rango: {inicio} a {fin}</h3>"]
 
     ventas_procesadas = set()
+    hoy = datetime.now(CHILE_TZ).strftime("%Y-%m-%d")  # Fecha actual en formato 'YYYY-MM-DD'
 
     for id_branch in SUCURSALES_EVO:
-        respuesta.append(f"<b>Sucursal EVO {id_branch}</b><br>")
-        try:
-            receivables = obtener_receivables(id_branch, inicio, fin)
-        except Exception as e:
-            logger.error(f"Error conexión EVO: {e}")
-            respuesta.append(f"Error conexión EVO: {str(e)}<br>")
+    respuesta.append(f"<b>Sucursal EVO {id_branch}</b><br>")
+    try:
+        receivables = obtener_receivables(id_branch, inicio, fin)
+    except Exception as e:
+        logger.error(f"Error conexión EVO: {e}")
+        respuesta.append(f"Error conexión EVO: {str(e)}<br>")
+        continue
+
+    for rec in receivables:
+        sale_date_str = rec.get("saleDate")
+        if not sale_date_str:
             continue
+        sale_date = sale_date_str.split("T")[0]  # Sólo la fecha, sin hora
+        if sale_date != hoy:
+            continue  # ⛔️ Salteá si la venta no es de hoy
 
-        for rec in receivables:
-            rec_id = rec.get("idReceivable")
-            if rec_id in ventas_procesadas:
-                continue
-            ventas_procesadas.add(rec_id)
+        rec_id = rec.get("idReceivable")
+        if rec_id in ventas_procesadas:
+            continue
+        ventas_procesadas.add(rec_id)
 
-            rec_key = f"receivable-{rec_id}"
-            try:
-                data = construir_boleta(rec, id_branch)
-                if modo == "prod":
-                    boleta_id, error = emitir_boleta_bsale(data)
-                    if boleta_id:
-                        respuesta.append(f"✔ Boleta generada ID {boleta_id} para {rec.get('payerName')}<br>")
-                        registrar_en_google_sheet(rec_key, boleta_id, rec.get('payerName'), rec.get('ammountPaid'), "OK")
-                    else:
-                        respuesta.append(f"❌ Error generando boleta: {error}<br>")
-                        registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {error}")
+        rec_key = f"receivable-{rec_id}"
+        try:
+            data = construir_boleta(rec, id_branch)
+            if modo == "prod":
+                boleta_id, error = emitir_boleta_bsale(data)
+                if boleta_id:
+                    respuesta.append(f"✔ Boleta generada ID {boleta_id} para {rec.get('payerName')}<br>")
+                    registrar_en_google_sheet(rec_key, boleta_id, rec.get('payerName'), rec.get('ammountPaid'), "OK")
                 else:
-                    respuesta.append(f"SIMULADO: {rec_key} Cliente {rec.get('payerName')}<br>")
-            except Exception as e:
-                respuesta.append(f"❌ Error {rec_key}: {str(e)}<br>")
-                registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {str(e)}")
+                    respuesta.append(f"❌ Error generando boleta: {error}<br>")
+                    registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {error}")
+            else:
+                respuesta.append(f"SIMULADO: {rec_key} Cliente {rec.get('payerName')}<br>")
+        except Exception as e:
+            respuesta.append(f"❌ Error {rec_key}: {str(e)}<br>")
+            registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), f"ERROR: {str(e)}")
 
     return "".join(respuesta)
 
@@ -364,6 +372,7 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
 
