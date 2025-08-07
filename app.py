@@ -88,14 +88,9 @@ creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
 client = gspread.authorize(creds)
 sheet = client.open(SHEET_NAME).sheet1
 
-def venta_ya_registrada_en_sheets(rec_key):
-    """Chequea si la venta ya fue registrada en Google Sheets (por ID EVO)"""
-    filas = sheet.get_all_values()
-    for fila in filas:
-        if fila and fila[0] == rec_key:
-            logger.info(f"Venta {rec_key} ya está registrada en Sheets.")
-            return True
-    return False
+def venta_ya_registrada_en_sheets(rec_key, registros_existentes):
+    return rec_key in registros_existentes
+
 
 def registrar_en_google_sheet(id_evo, id_bsale, cliente, monto, estado):
     filas = sheet.get_all_values()
@@ -298,6 +293,10 @@ def sincronizar():
     hoy = datetime.now(CHILE_TZ).strftime("%Y-%m-%d")
     respuesta = [f"<h3>Modo: {modo.upper()} | Rango: {inicio} a {fin}</h3>"]
 
+    # 👇 Lee todas las filas de Sheets SOLO UNA VEZ
+    filas = sheet.get_all_values()
+    registros_existentes = set(fila[0] for fila in filas if fila and fila[0])
+
     for id_branch in SUCURSALES_EVO:
         respuesta.append(f"<b>Sucursal EVO {id_branch}</b><br>")
         try:
@@ -318,31 +317,28 @@ def sincronizar():
             rec_id = rec.get("idReceivable")
             rec_key = f"receivable-{rec_id}"
 
-            # 💡 Chequea en Sheets antes de procesar
-            if venta_ya_registrada_en_sheets(rec_key):
+            # 💡 Chequea en memoria, NO en Sheets de nuevo
+            if venta_ya_registrada_en_sheets(rec_key, registros_existentes):
                 continue
 
             try:
-                # Registrar primero con estado "PENDIENTE"
                 registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), "PENDIENTE")
+                registros_existentes.add(rec_key)  # Importante: ¡agregar al set después de registrar!
 
                 data = construir_boleta(rec, id_branch)
                 if modo == "prod":
                     boleta_id, error = emitir_boleta_bsale(data)
-                    # Podrías actualizar la hoja con el resultado aquí (opcional)
                     if boleta_id:
                         respuesta.append(f"✔ Boleta generada ID {boleta_id} para {rec.get('payerName')}<br>")
-                        # Si querés, podés actualizar la fila con boleta_id y "OK"
                     else:
                         respuesta.append(f"❌ Error generando boleta: {error}<br>")
-                        # Podrías actualizar la fila con el error
                 else:
                     respuesta.append(f"SIMULADO: {rec_key} Cliente {rec.get('payerName')}<br>")
             except Exception as e:
                 respuesta.append(f"❌ Error {rec_key}: {str(e)}<br>")
-                # Podrías actualizar la fila con el error
 
     return "".join(respuesta)
+
 
 
 @app.route("/evo-webhook", methods=["POST"])
@@ -354,37 +350,39 @@ def evo_webhook():
     data = request.json
     logger.info(f"Webhook recibido: {data}")
 
+    # 👇 Lee registros solo una vez
+    filas = sheet.get_all_values()
+    registros_existentes = set(fila[0] for fila in filas if fila and fila[0])
+
     if data.get("EventType") == "NewSale":
         id_sale = data.get("IdRecord")
         id_branch = data.get("IdBranch")
         rec_id = f"receivable-{id_sale}"
 
-        # 💡 Chequea en Sheets antes de procesar
-        if venta_ya_registrada_en_sheets(rec_id):
+        if venta_ya_registrada_en_sheets(rec_id, registros_existentes):
             return jsonify({"status": "duplicated", "message": "Venta ya registrada"}), 200
 
         try:
-            # Registrar primero en Sheets con estado "PENDIENTE"
             registrar_en_google_sheet(rec_id, "-", "Desconocido", 0, "PENDIENTE")
+            registros_existentes.add(rec_id)
 
             rec = {"idSale": id_sale, "idReceivable": id_sale, "payerName": None, "ammountPaid": 0}
             data_boleta = construir_boleta(rec, id_branch)
             boleta_id, error = emitir_boleta_bsale(data_boleta)
             if boleta_id:
-                # Podrías actualizar la hoja aquí si querés
                 return jsonify({"status": "success", "boleta_id": boleta_id}), 200
             else:
-                # Podrías actualizar la hoja con el error
                 return jsonify({"status": "error", "message": error}), 500
         except Exception as e:
             logger.error(f"Error procesando venta {id_sale}: {e}")
-            # Podrías actualizar la hoja con el error
             return jsonify({"status": "error", "message": str(e)}), 500
 
     return jsonify({"status": "ignored"}), 200
 
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
 
