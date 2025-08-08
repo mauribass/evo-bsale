@@ -288,6 +288,9 @@ app = Flask(__name__)
 
 @app.route("/sincronizar")
 def sincronizar():
+    if os.environ.get("MODO_PAUSA") == "1":
+        logger.info("Sistema en pausa, sincronización ignorada.")
+        return "<h3>Modo pausa activo: no se procesan ventas.</h3>"
     modo = request.args.get("modo", "test")
     inicio, fin = rango_hoy()
     hoy = datetime.now(CHILE_TZ).strftime("%Y-%m-%d")
@@ -343,6 +346,10 @@ def sincronizar():
 
 @app.route("/evo-webhook", methods=["POST"])
 def evo_webhook():
+    if os.environ.get("MODO_PAUSA") == "1":
+        logger.info("Sistema en pausa, ignorando venta recibida por webhook.")
+        return jsonify({"status": "paused"}), 200
+        
     auth_header = request.headers.get("X-Webhook-Secret")
     if auth_header != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
@@ -382,6 +389,7 @@ def evo_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
 
