@@ -150,10 +150,11 @@ def obtener_receivables(id_branch, inicio, fin):
         res = session.get(f"{EVO_BASE_URL}/receivables", auth=(EVO_USER, EVO_PASS), params=params, timeout=20)
         res.raise_for_status()
         data = res.json()
-        lote = data si := (data if isinstance(data, list) else data.get("receivables", []))
-        if not si:
+        lote = data if isinstance(data, list) else data.get("receivables", [])
+        if not lote:
             break
-        resultados.extend(si)
+        resultados.extend(lote)
+
         if len(si) < 50:
             break
         skip += 50
@@ -460,3 +461,4 @@ if __name__ == "__main__":
     # Compatible con Render: usa el puerto asignado por la plataforma
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
