@@ -155,10 +155,11 @@ def obtener_receivables(id_branch, inicio, fin):
             break
         resultados.extend(lote)
 
-        if len(si) < 50:
+        if len(lote) < 50:
             break
         skip += 50
     return resultados
+
 
 def obtener_detalle_venta(id_sale):
     url = f"{EVO_BASE_URL}/sales/{id_sale}"
@@ -461,4 +462,5 @@ if __name__ == "__main__":
     # Compatible con Render: usa el puerto asignado por la plataforma
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
