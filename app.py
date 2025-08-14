@@ -11,18 +11,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-# Configurar sesión con reintentos
-session = requests.Session()
-retry_strategy = Retry(
-    total=3,  # máximo 3 intentos
-    backoff_factor=2,  # espera exponencial: 1s, 2s, 4s
-    status_forcelist=[500, 502, 503, 504],
-    allowed_methods=["GET", "POST"]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
-
+from difflib import SequenceMatcher
+from urllib.parse import quote
 
 # ============================================
 # CONFIGURACIÓN
@@ -44,7 +34,6 @@ DOCUMENT_TYPE_ID = 1
 PRICE_LIST_ID = 2
 VARIANT_MAP_FILE = "variant_map.json"
 VARIANT_ID_OTHERS = 1244  # Reemplazar por el ID real en Bsale
-
 
 SUCURSALES_EVO = [1, 3, 4]
 SUCURSALES_BSALE = {
@@ -89,15 +78,11 @@ client = gspread.authorize(creds)
 sheet = client.open(SHEET_NAME).sheet1
 
 def venta_ya_registrada_en_sheets(rec_key, registros_existentes):
+    """Chequea en memoria para evitar re-leer la planilla."""
     return rec_key in registros_existentes
 
-
 def registrar_en_google_sheet(id_evo, id_bsale, cliente, monto, estado):
-    filas = sheet.get_all_values()
-    for fila in filas:
-        if fila and fila[0] == id_evo:  # evitar duplicados
-            logger.info(f"Registro ya existe en Google Sheets para {id_evo}")
-            return
+    """Append directo. El control de duplicados se hace antes (en memoria)."""
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sheet.append_row([id_evo, id_bsale, cliente, monto, estado, fecha])
 
@@ -111,14 +96,22 @@ else:
     VARIANT_MAP = {}
 
 # ============================================
-# FUNCIONES AUXILIARES PARA NOMBRE Y FECHA
+# AUXILIARES (normalización / similitud)
 # ============================================
-def normalizar_nombre(nombre):
+def normalizar_nombre(nombre: str) -> str:
     if not nombre:
         return ''
     nombre = nombre.lower().strip()
     nombre = ''.join(c for c in unicodedata.normalize('NFD', nombre) if unicodedata.category(c) != 'Mn')
     return ' '.join(nombre.split())
+
+def _similitud(a: str, b: str) -> float:
+    """Similitud entre nombres normalizados (0..1)."""
+    if not a or not b:
+        return 0.0
+    a = normalizar_nombre(a)
+    b = normalizar_nombre(b)
+    return SequenceMatcher(None, a, b).ratio()
 
 def rango_hoy():
     ahora = datetime.now(CHILE_TZ)
@@ -178,7 +171,7 @@ def obtener_nombre_y_documento_de_sale(id_sale):
         return "Cliente EVO", None, None
 
 # ============================================
-# MAPEADOR POR NOMBRE (core del matcheo anterior)
+# MAPEADOR DE VARIANTES POR NOMBRE
 # ============================================
 def buscar_variant_id(nombre):
     nombre_normalizado = normalizar_nombre(nombre)
@@ -215,38 +208,81 @@ def construir_detalles(items_evo, rec):
     return detalles
 
 # ============================================
-# CLIENTES EN BSALE (sin creación automática)
+# CLIENTES EN BSALE (match por RUT o por NOMBRE, sin crear/actualizar)
 # ============================================
-def buscar_o_crear_cliente(nombre, rut=None, email=None):
-    headers = {"access_token": BSALE_TOKEN}
-
+def _buscar_cliente_bsale_por_rut(rut: str):
+    """Busca cliente EXISTENTE por RUT (taxNumber/code). No crea ni actualiza."""
     if not rut:
-        logger.info("No hay RUT. No se buscará ni asociará cliente.")
         return None
-
+    headers = {"access_token": BSALE_TOKEN}
     try:
-        # Buscar cliente por taxNumber (RUT)
-        url_busqueda = f"https://api.bsale.io/v1/clients.json?taxnumber={rut}"
-        res = session.get(url_busqueda, headers=headers, timeout=20)
-        res.raise_for_status()
-        items = res.json().get("items", [])
+        url = f"https://api.bsale.io/v1/clients.json?taxnumber={quote(str(rut))}"
+        r = session.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        items = r.json().get("items", [])
         if items:
-            logger.info(f"Cliente ya existe en Bsale con RUT {rut}, ID: {items[0]['id']}")
-            return items[0]["id"]
-        else:
-            logger.info(f"No existe cliente en Bsale con RUT {rut}. Se emitirá boleta sin cliente asociado.")
-            return None
+            cid = items[0]["id"]
+            logger.info(f"Cliente encontrado por RUT {rut}: ID {cid}")
+            return cid
     except Exception as e:
         logger.warning(f"No se pudo buscar cliente por RUT {rut}: {e}")
-        return None
+    return None
 
+def _buscar_cliente_bsale_por_nombre(nombre: str, umbral=0.85):
+    """Busca mejor coincidencia por nombre normalizado y devuelve ID si score>=umbral."""
+    if not nombre:
+        return None
+    headers = {"access_token": BSALE_TOKEN}
+    try:
+        best_id, best_score = None, 0.0
+        offset, limit = 0, 100
+        while True:
+            url = f"https://api.bsale.io/v1/clients.json?q={quote(nombre)}&limit={limit}&offset={offset}"
+            r = session.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            if not items:
+                break
+            for c in items:
+                score = _similitud(nombre, c.get("name", ""))
+                if score > best_score:
+                    best_score = score
+                    best_id = c.get("id")
+            if len(items) < limit:
+                break
+            offset += limit
+        if best_id and best_score >= umbral:
+            logger.info(f"Cliente encontrado por NOMBRE '{nombre}' → ID {best_id} (score={best_score:.2f})")
+            return best_id
+        logger.info(f"Sin coincidencia suficiente por NOMBRE '{nombre}' (mejor score={best_score:.2f})")
+    except Exception as e:
+        logger.warning(f"No se pudo buscar cliente por nombre '{nombre}': {e}")
+    return None
+
+def obtener_cliente_id_bsale(nombre_evo: str, rut_evo: str | None) -> int | None:
+    """
+    Devuelve clientId existente de Bsale:
+      1) Intenta por RUT
+      2) Fallback por nombre con similitud
+    Nunca crea ni actualiza clientes.
+    """
+    cid = _buscar_cliente_bsale_por_rut(rut_evo)
+    if cid:
+        return cid
+    return _buscar_cliente_bsale_por_nombre(nombre_evo, umbral=0.85)
 
 # ============================================
 # CONSTRUCCIÓN DE BOLETA
 # ============================================
 def construir_boleta(rec, id_branch):
     nombre, documento, email = obtener_nombre_y_documento_de_sale(rec['idSale'])
-    client_id = buscar_o_crear_cliente(nombre, documento, email)
+
+    # Usar SOLO clientes existentes (RUT → nombre; fallback por nombre similar)
+    client_id = obtener_cliente_id_bsale(nombre, documento)
+    if client_id:
+        logger.info(f"Documento se emitirá con clientId={client_id} (nombre se toma desde Bsale).")
+    else:
+        logger.info("Documento se emitirá SIN clientId (Consumidor Final).")
 
     sale_items = obtener_detalle_venta(rec["idSale"])
     items_evo = [
@@ -259,6 +295,7 @@ def construir_boleta(rec, id_branch):
     ]
     if not items_evo:
         items_evo.append({"nombre": "Otros EVO", "precio": rec.get("ammountPaid", 0), "cantidad": 1})
+
     detalles = construir_detalles(items_evo, rec)
 
     return {
@@ -266,7 +303,7 @@ def construir_boleta(rec, id_branch):
         "documentTypeId": DOCUMENT_TYPE_ID,
         "priceListId": PRICE_LIST_ID,
         "officeId": SUCURSALES_BSALE[id_branch],
-        "clientId": client_id,
+        "clientId": client_id,              # ← clave: sólo referenciamos el cliente existente
         "details": detalles
     }
 
@@ -276,7 +313,7 @@ def emitir_boleta_bsale(data):
     if res.status_code not in [200, 201]:
         try:
             error_msg = res.json().get("error", res.text)
-        except:
+        except Exception:
             error_msg = res.text
         return None, error_msg
     return res.json().get("id"), None
@@ -291,12 +328,13 @@ def sincronizar():
     if os.environ.get("MODO_PAUSA") == "1":
         logger.info("Sistema en pausa, sincronización ignorada.")
         return "<h3>Modo pausa activo: no se procesan ventas.</h3>"
+
     modo = request.args.get("modo", "test")
     inicio, fin = rango_hoy()
     hoy = datetime.now(CHILE_TZ).strftime("%Y-%m-%d")
     respuesta = [f"<h3>Modo: {modo.upper()} | Rango: {inicio} a {fin}</h3>"]
 
-    # 👇 Lee todas las filas de Sheets SOLO UNA VEZ
+    # Lee todas las filas de Sheets SOLO UNA VEZ
     filas = sheet.get_all_values()
     registros_existentes = set(fila[0] for fila in filas if fila and fila[0])
 
@@ -320,13 +358,13 @@ def sincronizar():
             rec_id = rec.get("idReceivable")
             rec_key = f"receivable-{rec_id}"
 
-            # 💡 Chequea en memoria, NO en Sheets de nuevo
+            # Chequea en memoria, NO en Sheets de nuevo
             if venta_ya_registrada_en_sheets(rec_key, registros_existentes):
                 continue
 
             try:
                 registrar_en_google_sheet(rec_key, "-", rec.get('payerName'), rec.get('ammountPaid'), "PENDIENTE")
-                registros_existentes.add(rec_key)  # Importante: ¡agregar al set después de registrar!
+                registros_existentes.add(rec_key)  # Importante: agregar al set después de registrar
 
                 data = construir_boleta(rec, id_branch)
                 if modo == "prod":
@@ -336,28 +374,28 @@ def sincronizar():
                     else:
                         respuesta.append(f"❌ Error generando boleta: {error}<br>")
                 else:
-                    respuesta.append(f"SIMULADO: {rec_key} Cliente {rec.get('payerName')}<br>")
+                    respuesta.append(f"SIMULADO: receivable-{rec.get('idReceivable')} Cliente {rec.get('payerName')}<br>")
             except Exception as e:
-                respuesta.append(f"❌ Error {rec_key}: {str(e)}<br>")
+                respuesta.append(f"❌ Error receivable-{rec.get('idReceivable')}: {str(e)}<br>")
 
     return "".join(respuesta)
 
-
-
 @app.route("/evo-webhook", methods=["POST"])
 def evo_webhook():
+    # Pausa por bandera de entorno
     if os.environ.get("MODO_PAUSA") == "1":
         logger.info("Sistema en pausa, ignorando venta recibida por webhook.")
         return jsonify({"status": "paused"}), 200
-        
+
+    # Autenticación básica del webhook
     auth_header = request.headers.get("X-Webhook-Secret")
     if auth_header != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.json
+    data = request.get_json(silent=True) or {}
     logger.info(f"Webhook recibido: {data}")
 
-    # 👇 Lee registros solo una vez
+    # Lee registros solo una vez
     filas = sheet.get_all_values()
     registros_existentes = set(fila[0] for fila in filas if fila and fila[0])
 
@@ -386,9 +424,15 @@ def evo_webhook():
 
     return jsonify({"status": "ignored"}), 200
 
+# ============================================
+# RUN
+# ============================================
+app = app  # para gunicorn `app:app`
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Compatible con Render: usa el puerto asignado por la plataforma
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
 
 
 
