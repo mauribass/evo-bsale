@@ -1,3 +1,4 @@
+import re
 import os
 import json
 import logging
@@ -30,7 +31,7 @@ CALLBACK_URL = os.getenv("CALLBACK_URL")
 if not EVO_USER or not EVO_PASS or not BSALE_TOKEN:
     raise RuntimeError("Faltan credenciales en variables de entorno.")
 
-DOCUMENT_TYPE_ID = 1
+DOCUMENT_TYPE_ID = int(os.getenv("DOCUMENT_TYPE_ID", "1"))
 PRICE_LIST_ID = 2
 VARIANT_MAP_FILE = "variant_map.json"
 VARIANT_ID_OTHERS = 1244  # Reemplazar por el ID real en Bsale
@@ -98,7 +99,21 @@ else:
 # ============================================
 # AUXILIARES (normalización / similitud)
 # ============================================
+def normalizar_rut_chile(rut: str | None) -> str | None:
+    if not rut:
+        return None
+    rut = rut.strip().upper()
+    rut = rut.replace(".", "").replace(" ", "")
+    # Mantener sólo dígitos y K, y un guión si viene
+    rut = re.sub(r"[^0-9K\-]", "", rut)
+    if "-" not in rut:
+        # Si viene sin guión, separar DV
+        cuerpo, dv = rut[:-1], rut[-1]
+        rut = f"{cuerpo}-{dv}"
+    return rut
+
 def normalizar_nombre(nombre: str) -> str:
+    import unicodedata
     if not nombre:
         return ''
     nombre = nombre.lower().strip()
@@ -106,12 +121,9 @@ def normalizar_nombre(nombre: str) -> str:
     return ' '.join(nombre.split())
 
 def _similitud(a: str, b: str) -> float:
-    """Similitud entre nombres normalizados (0..1)."""
     if not a or not b:
         return 0.0
-    a = normalizar_nombre(a)
-    b = normalizar_nombre(b)
-    return SequenceMatcher(None, a, b).ratio()
+    return SequenceMatcher(None, normalizar_nombre(a), normalizar_nombre(b)).ratio()
 
 def rango_hoy():
     ahora = datetime.now(CHILE_TZ)
@@ -210,25 +222,38 @@ def construir_detalles(items_evo, rec):
 # ============================================
 # CLIENTES EN BSALE (match por RUT o por NOMBRE, sin crear/actualizar)
 # ============================================
-def _buscar_cliente_bsale_por_rut(rut: str):
+def _buscar_cliente_bsale_por_rut(rut: str | None):
     """Busca cliente EXISTENTE por RUT (taxNumber/code). No crea ni actualiza."""
-    if not rut:
+    rut_norm = normalizar_rut_chile(rut)
+    if not rut_norm:
         return None
     headers = {"access_token": BSALE_TOKEN}
     try:
-        url = f"https://api.bsale.io/v1/clients.json?taxnumber={quote(str(rut))}"
+        # 1) Búsqueda directa por taxnumber
+        url = f"https://api.bsale.io/v1/clients.json?taxnumber={quote(rut_norm)}"
         r = session.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         items = r.json().get("items", [])
         if items:
             cid = items[0]["id"]
-            logger.info(f"Cliente encontrado por RUT {rut}: ID {cid}")
+            logger.info(f"Cliente encontrado por RUT {rut_norm}: ID {cid}")
             return cid
+
+        # 2) Fallback: búsqueda general por q, por si el formato difiere en cuenta
+        url_q = f"https://api.bsale.io/v1/clients.json?q={quote(rut_norm)}&limit=50"
+        r2 = session.get(url_q, headers=headers, timeout=20)
+        r2.raise_for_status()
+        for c in r2.json().get("items", []):
+            tax = normalizar_rut_chile(c.get("taxNumber"))
+            cod = normalizar_rut_chile(c.get("code"))
+            if tax == rut_norm or cod == rut_norm:
+                logger.info(f"Cliente encontrado por RUT (fallback q) {rut_norm}: ID {c['id']}")
+                return c["id"]
     except Exception as e:
         logger.warning(f"No se pudo buscar cliente por RUT {rut}: {e}")
     return None
 
-def _buscar_cliente_bsale_por_nombre(nombre: str, umbral=0.85):
+def _buscar_cliente_bsale_por_nombre(nombre: str, umbral=0.92):
     """Busca mejor coincidencia por nombre normalizado y devuelve ID si score>=umbral."""
     if not nombre:
         return None
@@ -251,6 +276,7 @@ def _buscar_cliente_bsale_por_nombre(nombre: str, umbral=0.85):
             if len(items) < limit:
                 break
             offset += limit
+
         if best_id and best_score >= umbral:
             logger.info(f"Cliente encontrado por NOMBRE '{nombre}' → ID {best_id} (score={best_score:.2f})")
             return best_id
@@ -260,16 +286,11 @@ def _buscar_cliente_bsale_por_nombre(nombre: str, umbral=0.85):
     return None
 
 def obtener_cliente_id_bsale(nombre_evo: str, rut_evo: str | None) -> int | None:
-    """
-    Devuelve clientId existente de Bsale:
-      1) Intenta por RUT
-      2) Fallback por nombre con similitud
-    Nunca crea ni actualiza clientes.
-    """
+    """1) intenta por RUT normalizado; 2) fallback por nombre; nunca crea clientes."""
     cid = _buscar_cliente_bsale_por_rut(rut_evo)
     if cid:
         return cid
-    return _buscar_cliente_bsale_por_nombre(nombre_evo, umbral=0.85)
+    return _buscar_cliente_bsale_por_nombre(nombre_evo, umbral=0.92)
 
 # ============================================
 # CONSTRUCCIÓN DE BOLETA
@@ -277,20 +298,15 @@ def obtener_cliente_id_bsale(nombre_evo: str, rut_evo: str | None) -> int | None
 def construir_boleta(rec, id_branch):
     nombre, documento, email = obtener_nombre_y_documento_de_sale(rec['idSale'])
 
-    # Usar SOLO clientes existentes (RUT → nombre; fallback por nombre similar)
     client_id = obtener_cliente_id_bsale(nombre, documento)
     if client_id:
         logger.info(f"Documento se emitirá con clientId={client_id} (nombre se toma desde Bsale).")
     else:
-        logger.info("Documento se emitirá SIN clientId (Consumidor Final).")
+        logger.info("Documento se emitirá SIN clientId (Consumidor Final / sin nombre y RUT).")
 
     sale_items = obtener_detalle_venta(rec["idSale"])
     items_evo = [
-        {
-            "nombre": it.get("description", "").strip(),
-            "precio": it.get("itemValue", 0),
-            "cantidad": it.get("quantity", 1),
-        }
+        {"nombre": it.get("description", "").strip(), "precio": it.get("itemValue", 0), "cantidad": it.get("quantity", 1)}
         for it in sale_items if it.get("description")
     ]
     if not items_evo:
@@ -298,14 +314,17 @@ def construir_boleta(rec, id_branch):
 
     detalles = construir_detalles(items_evo, rec)
 
-    return {
+    data = {
         "emissionDate": int(datetime.now().timestamp()),
         "documentTypeId": DOCUMENT_TYPE_ID,
         "priceListId": PRICE_LIST_ID,
         "officeId": SUCURSALES_BSALE[id_branch],
-        "clientId": client_id,              # ← clave: sólo referenciamos el cliente existente
         "details": detalles
     }
+    if client_id:           # ← solo agregamos clientId si hay match real
+        data["clientId"] = client_id
+
+    return data
 
 def emitir_boleta_bsale(data):
     headers = {"access_token": BSALE_TOKEN, "Content-Type": "application/json"}
@@ -433,6 +452,7 @@ if __name__ == "__main__":
     # Compatible con Render: usa el puerto asignado por la plataforma
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
 
 
