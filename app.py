@@ -31,10 +31,15 @@ CALLBACK_URL = os.getenv("CALLBACK_URL")
 if not EVO_USER or not EVO_PASS or not BSALE_TOKEN:
     raise RuntimeError("Faltan credenciales en variables de entorno.")
 
-DOCUMENT_TYPE_ID = int(os.getenv("DOCUMENT_TYPE_ID", "1"))
-PRICE_LIST_ID = 2
+# >>> CAMBIO CLAVE: 2 tipos de documento, no 1 <<<
+# - NOM: cuando SÍ hay clientId (documento nominativo)
+# - NN : cuando NO hay clientId (documento NO nominativo) → evita “inicial demo”
+DOCUMENT_TYPE_ID_NOM = int(os.getenv("DOCUMENT_TYPE_ID_NOM", "1"))  # ajusta a tu cuenta
+DOCUMENT_TYPE_ID_NN  = int(os.getenv("DOCUMENT_TYPE_ID_NN",  "28"))  # ajusta a tu cuenta
+
+PRICE_LIST_ID = int(os.getenv("PRICE_LIST_ID", "2"))
 VARIANT_MAP_FILE = "variant_map.json"
-VARIANT_ID_OTHERS = 1244  # Reemplazar por el ID real en Bsale
+VARIANT_ID_OTHERS = int(os.getenv("VARIANT_ID_OTHERS", "1244"))  # Reemplazar por el ID real en Bsale
 
 SUCURSALES_EVO = [1, 3, 4]
 SUCURSALES_BSALE = {
@@ -113,7 +118,6 @@ def normalizar_rut_chile(rut: str | None) -> str | None:
     return rut
 
 def normalizar_nombre(nombre: str) -> str:
-    import unicodedata
     if not nombre:
         return ''
     nombre = nombre.lower().strip()
@@ -146,11 +150,11 @@ def obtener_receivables(id_branch, inicio, fin):
         res = session.get(f"{EVO_BASE_URL}/receivables", auth=(EVO_USER, EVO_PASS), params=params, timeout=20)
         res.raise_for_status()
         data = res.json()
-        lote = data if isinstance(data, list) else data.get("receivables", [])
-        if not lote:
+        lote = data si := (data if isinstance(data, list) else data.get("receivables", []))
+        if not si:
             break
-        resultados.extend(lote)
-        if len(lote) < 50:
+        resultados.extend(si)
+        if len(si) < 50:
             break
         skip += 50
     return resultados
@@ -299,10 +303,6 @@ def construir_boleta(rec, id_branch):
     nombre, documento, email = obtener_nombre_y_documento_de_sale(rec['idSale'])
 
     client_id = obtener_cliente_id_bsale(nombre, documento)
-    if client_id:
-        logger.info(f"Documento se emitirá con clientId={client_id} (nombre se toma desde Bsale).")
-    else:
-        logger.info("Documento se emitirá SIN clientId (Consumidor Final / sin nombre y RUT).")
 
     sale_items = obtener_detalle_venta(rec["idSale"])
     items_evo = [
@@ -314,15 +314,23 @@ def construir_boleta(rec, id_branch):
 
     detalles = construir_detalles(items_evo, rec)
 
+    # Elegir tipo de documento según haya cliente o no
+    if client_id:
+        chosen_doc_type = DOCUMENT_TYPE_ID_NOM
+        logger.info(f"Documento NOMINATIVO con clientId={client_id} y documentTypeId={chosen_doc_type}.")
+    else:
+        chosen_doc_type = DOCUMENT_TYPE_ID_NN
+        logger.info(f"Documento NO NOMINATIVO sin clientId, documentTypeId={chosen_doc_type}.")
+
     data = {
         "emissionDate": int(datetime.now().timestamp()),
-        "documentTypeId": DOCUMENT_TYPE_ID,
+        "documentTypeId": chosen_doc_type,
         "priceListId": PRICE_LIST_ID,
         "officeId": SUCURSALES_BSALE[id_branch],
         "details": detalles
     }
-    if client_id:           # ← solo agregamos clientId si hay match real
-        data["clientId"] = client_id
+    if client_id:
+        data["clientId"] = client_id  # sólo cuando hay match real
 
     return data
 
@@ -452,19 +460,3 @@ if __name__ == "__main__":
     # Compatible con Render: usa el puerto asignado por la plataforma
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
